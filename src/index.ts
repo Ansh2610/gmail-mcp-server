@@ -70,10 +70,10 @@ function describeSendError(err: unknown): string {
       return "SMTP authentication failed (check GMAIL_ADDRESS and GMAIL_APP_PASSWORD)";
     case "ECONNECTION":
     case "ESOCKET":
-      return "SMTP connection refused or blocked (smtp.gmail.com:465 unreachable — check network allow-list)";
+      return "SMTP connection refused or blocked (smtp.gmail.com:587 unreachable — the egress proxy may block SMTP; check network allow-list)";
     case "ETIMEDOUT":
     case "ETIME":
-      return "SMTP connection timed out (smtp.gmail.com:465 unreachable — check network allow-list)";
+      return "SMTP connection timed out (smtp.gmail.com:587 unreachable — the egress proxy may block SMTP; check network allow-list)";
     case "EDNS":
       return "SMTP host could not be resolved (DNS lookup for smtp.gmail.com failed)";
     case "EENVELOPE":
@@ -94,12 +94,17 @@ function describeSendError(err: unknown): string {
 
 const transporter = nodemailer.createTransport({
   host: "smtp.gmail.com",
-  port: 465,
-  secure: true, // SSL
+  port: 587,
+  secure: false, // upgrade to TLS via STARTTLS
+  requireTLS: true, // never send credentials in the clear
   auth: {
     user: FROM_ADDRESS,
     pass: APP_PASSWORD,
   },
+  // Fail fast instead of hanging ~60s when the egress proxy blocks SMTP.
+  connectionTimeout: 15000, // TCP establish
+  greetingTimeout: 10000, // wait for server greeting
+  socketTimeout: 20000, // inactivity
 });
 
 // ---------------------------------------------------------------------------
@@ -118,12 +123,19 @@ server.tool(
     to: z.string().email().describe("Recipient email address"),
     subject: z.string().describe("Email subject line"),
     body: z.string().describe("Plain-text email body"),
+    cc: z
+      .string()
+      .optional()
+      .describe(
+        "Optional CC recipient(s). Comma-separate multiple addresses (e.g. 'a@x.com, b@y.com')."
+      ),
   },
-  async ({ to, subject, body }) => {
+  async ({ to, subject, body, cc }) => {
     try {
       const info = await transporter.sendMail({
         from: FROM_ADDRESS,
         to,
+        ...(cc ? { cc } : {}),
         subject,
         text: body,
       });
@@ -132,7 +144,7 @@ server.tool(
         content: [
           {
             type: "text" as const,
-            text: `Email sent to ${to} (messageId: ${info.messageId}).`,
+            text: `Email sent to ${to}${cc ? ` (cc: ${cc})` : ""} (messageId: ${info.messageId}).`,
           },
         ],
       };

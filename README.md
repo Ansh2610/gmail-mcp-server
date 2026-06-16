@@ -6,7 +6,7 @@ from a dedicated Gmail account to your inbox.
 
 - Local **stdio** MCP server (no HTTP, no remote endpoint).
 - One tool: `send_email(to, subject, body)`.
-- Sends via **SMTP** (`smtp.gmail.com:465`, SSL) using a Gmail **App Password** —
+- Sends via **SMTP** (`smtp.gmail.com:587`, STARTTLS) using a Gmail **App Password** —
   no OAuth, no Google API, no token storage, no inbox access.
 
 ## The tool
@@ -83,9 +83,16 @@ runs in the VM before the server is launched so `dist/index.js` exists.
 
 ## Network allow-list
 
-Outbound **TCP to `smtp.gmail.com` on port `465`** must be permitted. If your
-routine runs under a restrictive network policy (e.g. Claude Code on the web's
-non-"No network access" policies), add `smtp.gmail.com:465` to the allow-list —
-otherwise the send fails with `SMTP connection refused`/timed out. The server
-makes no other outbound connections. (DNS resolution of `smtp.gmail.com` must
-also be reachable.)
+Outbound **TCP to `smtp.gmail.com` on port `587`** (STARTTLS) must be permitted.
+If your routine runs under a restrictive network policy (e.g. Claude Code on the
+web's non-"No network access" policies), add `smtp.gmail.com:587` to the
+allow-list — otherwise the send fails fast with `SMTP connection refused`/timed
+out. The server makes no other outbound connections. (DNS resolution of
+`smtp.gmail.com` must also be reachable.)
+
+> **Note on egress proxies:** allow-listing the *domain* is not always enough.
+> Some egress proxies (including some Claude Code on the web network policies)
+> only proxy HTTPS/443 and block **all raw SMTP**, on both 587 and 465. If both
+> ports time out even though `smtp.gmail.com` is allow-listed, SMTP is being
+> blocked at the protocol/port level and you'll need an HTTPS-based send path
+> instead (see repo discussion).
