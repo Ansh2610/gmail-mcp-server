@@ -2,18 +2,20 @@
 /**
  * briefing-mailer — a minimal, send-only MCP server.
  *
- * Exposes exactly one tool, `send_email`, which delivers a message over SMTP
- * from a dedicated Gmail account. Intended to be launched as a local stdio
- * MCP server (see .mcp.json) inside a Claude Code routine's cloud VM.
+ * Exposes exactly one tool, `send_email`, which delivers a message from a
+ * dedicated Gmail account using the Gmail REST API over HTTPS (port 443).
+ * Intended to be launched as a local stdio MCP server (see .mcp.json) inside a
+ * Claude Code routine's cloud VM whose egress proxy blocks raw SMTP but allows
+ * HTTPS.
  *
- * No Gmail API, no OAuth, no inbound HTTP server, no token storage.
- * Credentials come from the environment only and are never logged or surfaced.
+ * No SMTP, no inbound HTTP server, no token storage on disk. Credentials come
+ * from the environment only and are never logged or surfaced.
  */
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { McpError, ErrorCode } from "@modelcontextprotocol/sdk/types.js";
-import nodemailer from "nodemailer";
+import { OAuth2Client } from "google-auth-library";
 import { z } from "zod";
 
 // ---------------------------------------------------------------------------
@@ -21,11 +23,15 @@ import { z } from "zod";
 // ---------------------------------------------------------------------------
 
 const GMAIL_ADDRESS = process.env.GMAIL_ADDRESS;
-const GMAIL_APP_PASSWORD = process.env.GMAIL_APP_PASSWORD;
+const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID;
+const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET;
+const GMAIL_REFRESH_TOKEN = process.env.GMAIL_REFRESH_TOKEN;
 
 const missing: string[] = [];
 if (!GMAIL_ADDRESS) missing.push("GMAIL_ADDRESS");
-if (!GMAIL_APP_PASSWORD) missing.push("GMAIL_APP_PASSWORD");
+if (!GOOGLE_CLIENT_ID) missing.push("GOOGLE_CLIENT_ID");
+if (!GOOGLE_CLIENT_SECRET) missing.push("GOOGLE_CLIENT_SECRET");
+if (!GMAIL_REFRESH_TOKEN) missing.push("GMAIL_REFRESH_TOKEN");
 
 if (missing.length > 0) {
   // Fail fast so a misconfigured routine run shows FAILED, not a silent no-op.
@@ -40,72 +46,132 @@ if (missing.length > 0) {
 
 // Narrowed to string after the guard above.
 const FROM_ADDRESS: string = GMAIL_ADDRESS!;
-const APP_PASSWORD: string = GMAIL_APP_PASSWORD!;
+const CLIENT_ID: string = GOOGLE_CLIENT_ID!;
+const CLIENT_SECRET: string = GOOGLE_CLIENT_SECRET!;
+const REFRESH_TOKEN: string = GMAIL_REFRESH_TOKEN!;
+
+const GMAIL_SEND_URL =
+  "https://gmail.googleapis.com/gmail/v1/users/me/messages/send";
 
 // ---------------------------------------------------------------------------
 // Error helpers — never leak credentials in any output.
 // ---------------------------------------------------------------------------
 
 /**
- * Strip any accidental occurrence of the credentials from a string. Defense in
- * depth: even sanitized reasons run through this before they leave the process.
+ * Strip any accidental occurrence of secrets from a string. Defense in depth:
+ * even sanitized reasons run through this before they leave the process.
  */
 function redact(text: string): string {
   let out = text;
-  if (FROM_ADDRESS) out = out.split(FROM_ADDRESS).join("[REDACTED]");
-  if (APP_PASSWORD) out = out.split(APP_PASSWORD).join("[REDACTED]");
+  for (const secret of [CLIENT_SECRET, REFRESH_TOKEN]) {
+    if (secret) out = out.split(secret).join("[REDACTED]");
+  }
+  // Belt-and-braces: scrub anything that looks like a bearer/access token.
+  out = out.replace(/ya29\.[A-Za-z0-9_\-.]+/g, "[REDACTED]");
+  out = out.replace(/Bearer\s+[A-Za-z0-9_\-.]+/gi, "Bearer [REDACTED]");
   return out;
 }
 
 /**
- * Map a nodemailer/SMTP failure to a clear, credential-free reason. We use the
- * structured error code rather than passing the raw library message through.
+ * Map an OAuth / Gmail API failure to a clear, credential-free reason. We read
+ * the structured error rather than passing raw library output through.
  */
 function describeSendError(err: unknown): string {
-  const e = err as { code?: string; responseCode?: number } | undefined;
-  const code = e?.code;
-
-  switch (code) {
-    case "EAUTH":
-      return "SMTP authentication failed (check GMAIL_ADDRESS and GMAIL_APP_PASSWORD)";
-    case "ECONNECTION":
-    case "ESOCKET":
-      return "SMTP connection refused or blocked (smtp.gmail.com:587 unreachable — the egress proxy may block SMTP; check network allow-list)";
-    case "ETIMEDOUT":
-    case "ETIME":
-      return "SMTP connection timed out (smtp.gmail.com:587 unreachable — the egress proxy may block SMTP; check network allow-list)";
-    case "EDNS":
-      return "SMTP host could not be resolved (DNS lookup for smtp.gmail.com failed)";
-    case "EENVELOPE":
-      return "SMTP rejected the message envelope (check the recipient address)";
-    case "EMESSAGE":
-      return "SMTP rejected the message content";
-    default:
-      if (typeof e?.responseCode === "number") {
-        return `SMTP send failed with response code ${e.responseCode}`;
+  const e = err as
+    | {
+        code?: string;
+        response?: { status?: number; data?: { error?: unknown } };
       }
-      return "SMTP send failed for an unknown reason";
+    | undefined;
+
+  const apiError = e?.response?.data?.error;
+
+  // OAuth token-endpoint errors return error as a string ("invalid_grant" etc.)
+  if (typeof apiError === "string") {
+    switch (apiError) {
+      case "invalid_grant":
+        return "OAuth refresh token is invalid, expired, or revoked (re-mint GMAIL_REFRESH_TOKEN)";
+      case "invalid_client":
+        return "OAuth client credentials are invalid (check GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET)";
+      case "invalid_scope":
+        return "OAuth token is missing the gmail.send scope (re-mint GMAIL_REFRESH_TOKEN with that scope)";
+      default:
+        return `OAuth error: ${apiError}`;
+    }
+  }
+
+  // Gmail API errors return error as an object with code/status.
+  if (apiError && typeof apiError === "object") {
+    const status = (apiError as { code?: number }).code ?? e?.response?.status;
+    switch (status) {
+      case 401:
+        return "Gmail API authorization failed (access token rejected)";
+      case 403:
+        return "Gmail API permission denied (ensure the Gmail API is enabled and the gmail.send scope was granted)";
+      case 400:
+        return "Gmail API rejected the request (check the recipient address and message)";
+      case 429:
+        return "Gmail API rate limit exceeded";
+      default:
+        return status
+          ? `Gmail API send failed with HTTP ${status}`
+          : "Gmail API send failed";
+    }
+  }
+
+  // Transport-level failures.
+  switch (e?.code) {
+    case "ENOTFOUND":
+    case "EAI_AGAIN":
+      return "Could not resolve gmail.googleapis.com (DNS lookup failed)";
+    case "ECONNREFUSED":
+    case "ETIMEDOUT":
+    case "ECONNRESET":
+      return "Could not reach gmail.googleapis.com over HTTPS (check network allow-list for port 443)";
+    default:
+      return "Gmail API send failed for an unknown reason";
   }
 }
 
 // ---------------------------------------------------------------------------
-// SMTP transport — Gmail over SSL on port 465.
+// OAuth2 client — exchanges the stored refresh token for access tokens and
+// signs Gmail API requests. The access token is refreshed automatically.
 // ---------------------------------------------------------------------------
 
-const transporter = nodemailer.createTransport({
-  host: "smtp.gmail.com",
-  port: 587,
-  secure: false, // upgrade to TLS via STARTTLS
-  requireTLS: true, // never send credentials in the clear
-  auth: {
-    user: FROM_ADDRESS,
-    pass: APP_PASSWORD,
-  },
-  // Fail fast instead of hanging ~60s when the egress proxy blocks SMTP.
-  connectionTimeout: 15000, // TCP establish
-  greetingTimeout: 10000, // wait for server greeting
-  socketTimeout: 20000, // inactivity
-});
+const oauth2 = new OAuth2Client(CLIENT_ID, CLIENT_SECRET);
+oauth2.setCredentials({ refresh_token: REFRESH_TOKEN });
+
+/**
+ * Build an RFC 5322 message and base64url-encode it for the Gmail API.
+ * Non-ASCII subjects are RFC 2047 encoded; the body is sent as UTF-8.
+ */
+function buildRawMessage(opts: {
+  to: string;
+  cc?: string;
+  subject: string;
+  body: string;
+}): string {
+  const encodeHeader = (value: string): string =>
+    // eslint-disable-next-line no-control-regex
+    /^[\x00-\x7F]*$/.test(value)
+      ? value
+      : `=?UTF-8?B?${Buffer.from(value, "utf-8").toString("base64")}?=`;
+
+  const headers = [
+    `From: ${FROM_ADDRESS}`,
+    `To: ${opts.to}`,
+    ...(opts.cc ? [`Cc: ${opts.cc}`] : []),
+    `Subject: ${encodeHeader(opts.subject)}`,
+    "MIME-Version: 1.0",
+    'Content-Type: text/plain; charset="UTF-8"',
+    "Content-Transfer-Encoding: base64",
+  ];
+
+  const encodedBody = Buffer.from(opts.body, "utf-8").toString("base64");
+  const mime = `${headers.join("\r\n")}\r\n\r\n${encodedBody}`;
+
+  return Buffer.from(mime, "utf-8").toString("base64url");
+}
 
 // ---------------------------------------------------------------------------
 // MCP server — exactly one tool.
@@ -118,7 +184,7 @@ const server = new McpServer({
 
 server.tool(
   "send_email",
-  "Send a single email from the configured Gmail account over SMTP. Returns success, or throws an error (with the credentials redacted) if delivery fails.",
+  "Send a single email from the configured Gmail account via the Gmail API (HTTPS). Returns success, or throws an error (with credentials redacted) if delivery fails.",
   {
     to: z.string().email().describe("Recipient email address"),
     subject: z.string().describe("Email subject line"),
@@ -132,19 +198,20 @@ server.tool(
   },
   async ({ to, subject, body, cc }) => {
     try {
-      const info = await transporter.sendMail({
-        from: FROM_ADDRESS,
-        to,
-        ...(cc ? { cc } : {}),
-        subject,
-        text: body,
+      const raw = buildRawMessage({ to, cc, subject, body });
+
+      const res = await oauth2.request<{ id?: string }>({
+        url: GMAIL_SEND_URL,
+        method: "POST",
+        data: { raw },
       });
 
+      const id = res.data?.id ?? "unknown";
       return {
         content: [
           {
             type: "text" as const,
-            text: `Email sent to ${to}${cc ? ` (cc: ${cc})` : ""} (messageId: ${info.messageId}).`,
+            text: `Email sent to ${to}${cc ? ` (cc: ${cc})` : ""} (messageId: ${id}).`,
           },
         ],
       };
@@ -167,7 +234,7 @@ async function main(): Promise<void> {
   const transport = new StdioServerTransport();
   await server.connect(transport);
   // Log to stderr only — stdout is reserved for the MCP protocol stream.
-  console.error("[briefing-mailer] stdio MCP server ready.");
+  console.error("[briefing-mailer] stdio MCP server ready (Gmail API/HTTPS).");
 }
 
 main().catch((err) => {
