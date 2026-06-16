@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "briefing-mailer": {
+      "command": "node",
+      "args": ["dist/index.js"],
+      "env": {
+        "GMAIL_ADDRESS": "${GMAIL_ADDRESS}",
+        "GMAIL_APP_PASSWORD": "${GMAIL_APP_PASSWORD}"
+      }
+    }
+  }
+}
